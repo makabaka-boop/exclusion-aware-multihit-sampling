@@ -1,0 +1,14 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: materiallab-api:latest
+    container_name: materiallab-api
+    ports:
+      - "8080:8080"
+    environment:
+      ADDR: ":8080"
+    restart: unless-stopped
+    # Liveness can be probed from the host:  curl -fsS http://localhost:8080/healthz
+    # The distroless image contains no shell, so no in-container shell probe.
