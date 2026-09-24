@@ -61,6 +61,51 @@ func TestAPI_HappyPath(t *testing.T) {
 	if int(got["sample_count"].(float64)) != 2 {
 		t.Fatalf("sample_count = %v", got["sample_count"])
 	}
+	// Unset requiredHits keeps single-hit semantics; per-interval hits follow
+	// the processing order.
+	hits := got["interval_hits"].([]any)
+	if len(hits) != 2 {
+		t.Fatalf("interval_hits = %v", hits)
+	}
+	for i, want := range []struct {
+		id      string
+		batches []int64
+	}{{"R1", []int64{4}}, {"R2", []int64{10}}} {
+		h := hits[i].(map[string]any)
+		if h["interval_id"] != want.id || !reflect.DeepEqual(asInt64s(h["batches"].([]any)), want.batches) {
+			t.Fatalf("interval_hits[%d] = %v, want %v", i, h, want)
+		}
+	}
+}
+
+func TestAPI_RequiredHits(t *testing.T) {
+	h := Handler()
+	// R1 needs two distinct batches inside [1,5]; R2 shares them since [3,5]
+	// also contains 4 and 5.
+	body := `{
+		"intervals": [
+			{"id": "R1", "start": 1, "end": 5, "requiredHits": 2},
+			{"id": "R2", "start": 3, "end": 5}
+		],
+		"frozen": []
+	}`
+	status, got := post(t, h, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body=%v", status, got)
+	}
+	if int(got["sample_count"].(float64)) != 2 {
+		t.Fatalf("sample_count = %v", got["sample_count"])
+	}
+	hits := got["interval_hits"].([]any)
+	for i, wantID := range []string{"R1", "R2"} {
+		h := hits[i].(map[string]any)
+		if h["interval_id"] != wantID {
+			t.Fatalf("hits[%d] = %v", i, h)
+		}
+		if !reflect.DeepEqual(asInt64s(h["batches"].([]any)), []int64{4, 5}) {
+			t.Fatalf("hits[%d] batches = %v", i, h["batches"])
+		}
+	}
 }
 
 func TestAPI_NoSamplePoint(t *testing.T) {
@@ -79,8 +124,34 @@ func TestAPI_NoSamplePoint(t *testing.T) {
 	if got["failed_interval_id"] != "R1" || int(got["failed_position"].(float64)) != 1 {
 		t.Fatalf("failure fields = %v", got)
 	}
+	// [3,4] is fully frozen: zero free integers for a demand of one -> gap 1.
+	if int(got["failed_missing"].(float64)) != 1 {
+		t.Fatalf("failed_missing = %v", got["failed_missing"])
+	}
 	if int(got["sample_count"].(float64)) != 0 {
 		t.Fatalf("sample_count = %v", got["sample_count"])
+	}
+	if len(got["points"].([]any)) != 0 {
+		t.Fatalf("partial plan leaked: %v", got["points"])
+	}
+}
+
+func TestAPI_RequiredHitsGap(t *testing.T) {
+	h := Handler()
+	// [1,3] has exactly two free integers (1 and 2) for a demand of 3: gap 1.
+	body := `{
+		"intervals": [{"id": "R1", "start": 1, "end": 3, "requiredHits": 3}],
+		"frozen": [{"start": 3, "end": 3}]
+	}`
+	status, got := post(t, h, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body=%v", status, got)
+	}
+	if got["status"] != "NO_SAMPLE_POINT" || got["failed_interval_id"] != "R1" {
+		t.Fatalf("body = %v", got)
+	}
+	if int(got["failed_position"].(float64)) != 1 || int(got["failed_missing"].(float64)) != 1 {
+		t.Fatalf("failure fields = %v", got)
 	}
 	if len(got["points"].([]any)) != 0 {
 		t.Fatalf("partial plan leaked: %v", got["points"])
@@ -112,6 +183,11 @@ func TestAPI_Validation422(t *testing.T) {
 		"frozen negative":          `{"intervals":[{"id":"a","start":0,"end":1}],"frozen":[{"start":-2,"end":-1}]}`,
 		"empty id":                 `{"intervals":[{"id":"","start":0,"end":1}],"frozen":[]}`,
 		"malformed json":           `{not json`,
+		"requiredHits zero":        `{"intervals":[{"id":"a","start":0,"end":1,"requiredHits":0}],"frozen":[]}`,
+		"requiredHits above three": `{"intervals":[{"id":"a","start":0,"end":1,"requiredHits":4}],"frozen":[]}`,
+		"requiredHits negative":    `{"intervals":[{"id":"a","start":0,"end":1,"requiredHits":-1}],"frozen":[]}`,
+		"requiredHits float":       `{"intervals":[{"id":"a","start":0,"end":1,"requiredHits":1.5}],"frozen":[]}`,
+		"requiredHits string":      `{"intervals":[{"id":"a","start":0,"end":1,"requiredHits":"2"}],"frozen":[]}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -185,6 +261,14 @@ func asStrings(in []any) []string {
 	out := make([]string, len(in))
 	for i, v := range in {
 		out[i] = v.(string)
+	}
+	return out
+}
+
+func asInt64s(in []any) []int64 {
+	out := make([]int64, len(in))
+	for i, v := range in {
+		out[i] = int64(v.(float64))
 	}
 	return out
 }

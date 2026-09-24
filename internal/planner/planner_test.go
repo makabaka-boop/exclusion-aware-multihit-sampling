@@ -8,6 +8,14 @@ import (
 	"testing"
 )
 
+// reqHits returns the effective hit requirement (unset means 1).
+func reqHits(iv Interval) int {
+	if iv.RequiredHits < 1 {
+		return 1
+	}
+	return iv.RequiredHits
+}
+
 // bruteFreeSet returns the set of selectable integers within [lo,hi].
 func bruteFreeSet(seg []Segment, lo, hi int64) map[int64]bool {
 	frozen := map[int64]bool{}
@@ -27,7 +35,8 @@ func bruteFreeSet(seg []Segment, lo, hi int64) map[int64]bool {
 
 // bruteMin enumerates every subset of the free integers on the union of
 // interval endpoints' bounding box and returns the minimum subset size that
-// hits every risk interval. ok=false when some interval is fully frozen.
+// gives every risk interval at least RequiredHits distinct hits. ok=false when
+// some interval does not contain enough free integers.
 func bruteMin(intervals []Interval, frozen []FrozenRange) (int, bool) {
 	seg := NormalizeFrozen(frozen)
 
@@ -43,14 +52,13 @@ func bruteMin(intervals []Interval, frozen []FrozenRange) (int, bool) {
 
 	free := bruteFreeSet(seg, lo, hi)
 	for _, iv := range intervals {
-		has := false
+		cnt := 0
 		for x := iv.Start; x <= iv.End; x++ {
 			if free[x] {
-				has = true
-				break
+				cnt++
 			}
 		}
-		if !has {
+		if cnt < reqHits(iv) {
 			return 0, false
 		}
 	}
@@ -79,14 +87,13 @@ func bruteMin(intervals []Interval, frozen []FrozenRange) (int, bool) {
 		}
 		hitsAll := true
 		for _, iv := range intervals {
-			hit := false
+			hit := 0
 			for b, p := range points {
 				if chosen[b] && p >= iv.Start && p <= iv.End {
-					hit = true
-					break
+					hit++
 				}
 			}
-			if !hit {
+			if hit < reqHits(iv) {
 				hitsAll = false
 				break
 			}
@@ -99,8 +106,9 @@ func bruteMin(intervals []Interval, frozen []FrozenRange) (int, bool) {
 }
 
 // verifyResult independently re-checks every invariant of a Plan result:
-// feasibility, coverage, minimality against brute force, increasing batches,
-// coverage partition, stable processing order and determinism.
+// feasibility, per-interval hit counts, minimality against brute force,
+// increasing batches, hit/coverage transposes, stable processing order and
+// determinism.
 func verifyResult(t *testing.T, intervals []Interval, frozen []FrozenRange) {
 	t.Helper()
 
@@ -131,24 +139,25 @@ func verifyResult(t *testing.T, intervals []Interval, frozen []FrozenRange) {
 		t.Fatalf("processing order = %v, want %v", res.Order, wantIDs)
 	}
 
+	seg := NormalizeFrozen(frozen)
 	min, feasible := bruteMin(intervals, frozen)
 
 	if !feasible {
 		if res.Status != "NO_SAMPLE_POINT" {
 			t.Fatalf("want NO_SAMPLE_POINT, got %+v", res)
 		}
-		if len(res.Points) != 0 {
-			t.Fatalf("failure must not leave a partial plan, got %+v", res.Points)
+		if len(res.Points) != 0 || len(res.Hits) != 0 {
+			t.Fatalf("failure must not leave a partial plan, got %+v / %+v", res.Points, res.Hits)
 		}
-		// Failed interval must be the earliest (by processing order) fully frozen one.
-		seg := NormalizeFrozen(frozen)
+		// Failed interval must be the earliest (by processing order) one with
+		// too few free integers, and the gap must match exactly.
 		earliest := ""
-		var pos int
+		var pos, missing int
 		for p, id := range res.Order {
 			iv := byID[id]
 			free := bruteFreeSet(seg, iv.Start, iv.End)
-			if len(free) == 0 {
-				earliest, pos = id, p+1
+			if k := reqHits(iv); len(free) < k {
+				earliest, pos, missing = id, p+1, k-len(free)
 				break
 			}
 		}
@@ -157,6 +166,9 @@ func verifyResult(t *testing.T, intervals []Interval, frozen []FrozenRange) {
 		}
 		if res.Fail.Position != pos {
 			t.Fatalf("failed position = %d, want %d", res.Fail.Position, pos)
+		}
+		if res.Fail.Missing != missing {
+			t.Fatalf("failed missing = %d, want %d", res.Fail.Missing, missing)
 		}
 		return
 	}
@@ -169,7 +181,7 @@ func verifyResult(t *testing.T, intervals []Interval, frozen []FrozenRange) {
 			len(res.Points), min, intervals, frozen, res.Points)
 	}
 
-	// Batches strictly increasing.
+	// Batches strictly increasing and distinct.
 	for i := 1; i < len(res.Points); i++ {
 		if res.Points[i-1].Batch >= res.Points[i].Batch {
 			t.Fatalf("batches not strictly increasing: %+v", res.Points)
@@ -177,34 +189,56 @@ func verifyResult(t *testing.T, intervals []Interval, frozen []FrozenRange) {
 	}
 
 	// Every chosen batch is outside every frozen segment (normalized).
-	seg := NormalizeFrozen(frozen)
-	covered := map[string]bool{}
-	assignedCount := 0
 	for _, pt := range res.Points {
 		for _, s := range seg {
 			if pt.Batch >= s.Start && pt.Batch <= s.End {
 				t.Fatalf("chosen batch %d lies in frozen segment %v", pt.Batch, s)
 			}
 		}
-		for _, id := range pt.Covered {
-			if covered[id] {
-				t.Fatalf("interval %q covered by multiple points", id)
-			}
-			covered[id] = true
-			assignedCount++
-			iv := byID[id]
-			if pt.Batch < iv.Start || pt.Batch > iv.End {
-				t.Fatalf("batch %d does not cover interval %q = %v", pt.Batch, id, iv)
+	}
+
+	// Per-interval hits: exactly the selected batches inside the interval,
+	// ascending, at least RequiredHits many, aligned with processing order.
+	if len(res.Hits) != len(intervals) {
+		t.Fatalf("hits length = %d, want %d", len(res.Hits), len(intervals))
+	}
+	coveredBy := map[int64][]string{}
+	for pos, id := range res.Order {
+		h := res.Hits[pos]
+		if h.IntervalID != id {
+			t.Fatalf("hits[%d].id = %q, want %q (processing order)", pos, h.IntervalID, id)
+		}
+		iv := byID[id]
+		want := []int64{}
+		for _, pt := range res.Points {
+			if pt.Batch >= iv.Start && pt.Batch <= iv.End {
+				want = append(want, pt.Batch)
 			}
 		}
+		if !reflect.DeepEqual(h.Batches, want) {
+			t.Fatalf("hits[%d] (%q) = %v, want %v", pos, id, h.Batches, want)
+		}
+		if len(h.Batches) < reqHits(iv) {
+			t.Fatalf("interval %q has %d hits, requires %d", id, len(h.Batches), reqHits(iv))
+		}
+		for _, p := range h.Batches {
+			coveredBy[p] = append(coveredBy[p], id)
+		}
 	}
-	if assignedCount != len(intervals) {
-		t.Fatalf("coverage partition has %d assignments, want %d", assignedCount, len(intervals))
+
+	// Points' Covered lists are the transpose of the per-interval hits.
+	for _, pt := range res.Points {
+		if !reflect.DeepEqual(pt.Covered, coveredBy[pt.Batch]) {
+			t.Fatalf("point %d covered = %v, want transpose %v", pt.Batch, pt.Covered, coveredBy[pt.Batch])
+		}
+		if len(pt.Covered) == 0 {
+			t.Fatalf("point %d covers no interval", pt.Batch)
+		}
 	}
 }
 
 func TestNoFrozenClassic(t *testing.T) {
-	// Classic greedy example.
+	// Classic greedy example, all intervals implicitly single-hit.
 	ivs := []Interval{
 		{ID: "a", Start: 1, End: 3},
 		{ID: "b", Start: 2, End: 6},
@@ -220,6 +254,79 @@ func TestNoFrozenClassic(t *testing.T) {
 			t.Fatalf("point %d = %d, want %d", i, res.Points[i].Batch, w)
 		}
 	}
+}
+
+func TestRequiredHitsDefaultIsOne(t *testing.T) {
+	// Unset RequiredHits must behave exactly like an explicit 1.
+	ivs := []Interval{
+		{ID: "a", Start: 0, End: 4},
+		{ID: "b", Start: 1, End: 3},
+	}
+	explicit := []Interval{
+		{ID: "a", Start: 0, End: 4, RequiredHits: 1},
+		{ID: "b", Start: 1, End: 3, RequiredHits: 1},
+	}
+	if got, want := Plan(ivs, nil), Plan(explicit, nil); !reflect.DeepEqual(got, want) {
+		t.Fatalf("unset != explicit 1:\n%+v\n%+v", got, want)
+	}
+	verifyResult(t, ivs, nil)
+}
+
+func TestMultiHitPicksRightToLeft(t *testing.T) {
+	// One interval asking for 3 distinct samples gets the three rightmost
+	// free integers.
+	ivs := []Interval{{ID: "a", Start: 2, End: 9, RequiredHits: 3}}
+	res := Plan(ivs, nil)
+	want := []int64{7, 8, 9}
+	got := []int64{res.Points[0].Batch, res.Points[1].Batch, res.Points[2].Batch}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("batches = %v, want %v", got, want)
+	}
+	if !reflect.DeepEqual(res.Hits[0].Batches, want) {
+		t.Fatalf("hits = %v, want %v", res.Hits[0].Batches, want)
+	}
+	verifyResult(t, ivs, nil)
+}
+
+func TestOverlappingRequiredHits(t *testing.T) {
+	// Overlapping demands share batches: [1,5]x2 and [3,7]x2 need only
+	// {4,5}: both batches lie in both intervals.
+	ivs := []Interval{
+		{ID: "a", Start: 1, End: 5, RequiredHits: 2},
+		{ID: "b", Start: 3, End: 7, RequiredHits: 2},
+	}
+	res := Plan(ivs, nil)
+	if len(res.Points) != 2 || res.Points[0].Batch != 4 || res.Points[1].Batch != 5 {
+		t.Fatalf("plan = %+v", res.Points)
+	}
+	for _, h := range res.Hits {
+		if !reflect.DeepEqual(h.Batches, []int64{4, 5}) {
+			t.Fatalf("hits of %q = %v", h.IntervalID, h.Batches)
+		}
+	}
+	for _, pt := range res.Points {
+		if !reflect.DeepEqual(pt.Covered, []string{"a", "b"}) {
+			t.Fatalf("point %d covered = %v", pt.Batch, pt.Covered)
+		}
+	}
+	verifyResult(t, ivs, nil)
+
+	// A later point falling inside an already-satisfied interval still shows
+	// up in that interval's actual hits.
+	ivs2 := []Interval{
+		{ID: "i", Start: 8, End: 10},
+		{ID: "j", Start: 1, End: 10, RequiredHits: 2},
+	}
+	res2 := Plan(ivs2, nil)
+	if len(res2.Points) != 2 || res2.Points[0].Batch != 9 || res2.Points[1].Batch != 10 {
+		t.Fatalf("plan2 = %+v", res2.Points)
+	}
+	// Processing order is i (end 10, id i) then j; i is actually hit by both.
+	if !reflect.DeepEqual(res2.Hits[0].Batches, []int64{9, 10}) ||
+		!reflect.DeepEqual(res2.Hits[1].Batches, []int64{9, 10}) {
+		t.Fatalf("hits2 = %+v", res2.Hits)
+	}
+	verifyResult(t, ivs2, nil)
 }
 
 func TestTouchingFrozenMerged(t *testing.T) {
@@ -245,12 +352,39 @@ func TestTouchingFrozenMerged(t *testing.T) {
 	}
 }
 
+func TestTouchingFrozenMultiHit(t *testing.T) {
+	// Touching frozen segments merge, so [0,4] keeps only {0,4} selectable
+	// and a demand of 3 fails with a gap of 1.
+	ivs := []Interval{{ID: "a", Start: 0, End: 4, RequiredHits: 3}}
+	frozen := []FrozenRange{{Start: 1, End: 2}, {Start: 3, End: 3}}
+	res := Plan(ivs, frozen)
+	if res.Status != "NO_SAMPLE_POINT" {
+		t.Fatalf("res = %+v", res)
+	}
+	if res.Fail.IntervalID != "a" || res.Fail.Position != 1 || res.Fail.Missing != 1 {
+		t.Fatalf("fail = %+v", res.Fail)
+	}
+	if len(res.Points) != 0 || len(res.Hits) != 0 {
+		t.Fatalf("partial plan leaked: %+v", res)
+	}
+	verifyResult(t, ivs, frozen)
+
+	// Demand 2 fits exactly: the two endpoints survive.
+	ivs2 := []Interval{{ID: "a", Start: 0, End: 4, RequiredHits: 2}}
+	res2 := Plan(ivs2, frozen)
+	if len(res2.Points) != 2 || res2.Points[0].Batch != 0 || res2.Points[1].Batch != 4 {
+		t.Fatalf("plan = %+v", res2.Points)
+	}
+	verifyResult(t, ivs2, frozen)
+}
+
 func TestSinglePointIntervals(t *testing.T) {
 	cases := []struct {
-		name   string
-		ivs    []Interval
-		frozen []FrozenRange
-		failID string
+		name    string
+		ivs     []Interval
+		frozen  []FrozenRange
+		failID  string
+		missing int
 	}{
 		{
 			name:   "free single points all share one sample",
@@ -262,12 +396,28 @@ func TestSinglePointIntervals(t *testing.T) {
 			ivs:    []Interval{{ID: "a", Start: 1, End: 2}, {ID: "b", Start: 5, End: 5}},
 			frozen: []FrozenRange{{Start: 5, End: 5}},
 			failID: "b",
+			// [5,5] has zero free integers and needs 1.
+			missing: 1,
 		},
 		{
 			name:   "whole endpoint range frozen by touching pair",
 			ivs:    []Interval{{ID: "a", Start: 4, End: 5}},
 			frozen: []FrozenRange{{Start: 4, End: 4}, {Start: 5, End: 5}},
 			failID: "a",
+			// [4,5] has zero free integers and needs 1.
+			missing: 1,
+		},
+		{
+			name:    "single point cannot serve two samples",
+			ivs:     []Interval{{ID: "a", Start: 9, End: 9, RequiredHits: 2}},
+			failID:  "a",
+			missing: 1,
+		},
+		{
+			name:    "single point interval demands three",
+			ivs:     []Interval{{ID: "a", Start: 9, End: 9, RequiredHits: 3}},
+			failID:  "a",
+			missing: 2,
 		},
 	}
 	for _, tc := range cases {
@@ -277,6 +427,9 @@ func TestSinglePointIntervals(t *testing.T) {
 				res := Plan(tc.ivs, tc.frozen)
 				if res.Fail.IntervalID != tc.failID {
 					t.Fatalf("fail id = %q, want %q", res.Fail.IntervalID, tc.failID)
+				}
+				if res.Fail.Missing != tc.missing {
+					t.Fatalf("missing = %d, want %d", res.Fail.Missing, tc.missing)
 				}
 			}
 		})
@@ -315,6 +468,21 @@ func TestSameRightEndpointStableOrder(t *testing.T) {
 		t.Fatalf("plan = %+v", res2.Points)
 	}
 	verifyResult(t, ivs2, nil)
+
+	// Same right endpoint with distinct demands: the single-hit interval is
+	// processed first (id order), then the double-hit one tops up to its left.
+	ivs3 := []Interval{
+		{ID: "b", Start: 0, End: 5, RequiredHits: 2},
+		{ID: "a", Start: 0, End: 5},
+	}
+	res3 := Plan(ivs3, nil)
+	if !reflect.DeepEqual(res3.Order, []string{"a", "b"}) {
+		t.Fatalf("order = %v", res3.Order)
+	}
+	if len(res3.Points) != 2 || res3.Points[0].Batch != 4 || res3.Points[1].Batch != 5 {
+		t.Fatalf("plan = %+v", res3.Points)
+	}
+	verifyResult(t, ivs3, nil)
 }
 
 func TestFrozenPushesSampleLeft(t *testing.T) {
@@ -352,12 +520,27 @@ func TestFrozenBetweenIntervals(t *testing.T) {
 	}
 }
 
+func TestFrozenMultiHitSkipsUsedAndFrozen(t *testing.T) {
+	// [0,6] needs 3 distinct batches; 6 and 5 are frozen, so the picks are
+	// 4, 3, 2 from right to left.
+	ivs := []Interval{{ID: "a", Start: 0, End: 6, RequiredHits: 3}}
+	frozen := []FrozenRange{{Start: 5, End: 6}}
+	res := Plan(ivs, frozen)
+	want := []int64{2, 3, 4}
+	got := []int64{res.Points[0].Batch, res.Points[1].Batch, res.Points[2].Batch}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("batches = %v, want %v", got, want)
+	}
+	verifyResult(t, ivs, frozen)
+}
+
 // itoaTest keeps the exhaustive loop free of strconv noise at call sites.
 func itoaTest(n int) string { return strconv.Itoa(n) }
 
 // TestExhaustiveSmall enumerates all combinations of risk intervals over a
-// small coordinate universe and every frozen mask, cross-checking the greedy
-// result against brute-force enumeration of all point subsets.
+// small coordinate universe, a spread of RequiredHits assignments and every
+// frozen mask, cross-checking the greedy result against brute-force
+// enumeration of all point subsets.
 func TestExhaustiveSmall(t *testing.T) {
 	const n = 5 // coordinates 0..4
 
@@ -369,6 +552,12 @@ func TestExhaustiveSmall(t *testing.T) {
 			all = append(all, raw{l, r})
 		}
 	}
+
+	// Hit-demand patterns: exhaustive for singles and pairs, representative
+	// (uniform and mixed) for triples to keep the runtime bounded.
+	pat1 := [][1]int{{1}, {2}, {3}}
+	pat2 := [][2]int{{1, 1}, {1, 2}, {1, 3}, {2, 1}, {2, 2}, {2, 3}, {3, 1}, {3, 2}, {3, 3}}
+	pat3 := [][3]int{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}, {1, 2, 3}, {3, 2, 1}, {2, 1, 3}}
 
 	// Every possible frozen subset (as merged segments): iterate masks over
 	// coordinates and convert runs to frozen ranges.
@@ -388,23 +577,26 @@ func TestExhaustiveSmall(t *testing.T) {
 			}
 		}
 
-		// Enumerate every singleton/pair/triple of intervals for every frozen
-		// mask: 15 + C(16,2)=120 pairs + C(17,3)=680 triples per mask.
-		// Each brute force scans at most 2^5 subsets, so this is cheap.
-		emit := func(picks ...raw) {
+		emit := func(ks []int, picks ...raw) {
 			ivs := make([]Interval, len(picks))
 			for k, p := range picks {
-				ivs[k] = Interval{ID: "i" + itoaTest(k), Start: p.l, End: p.r}
+				ivs[k] = Interval{ID: "i" + itoaTest(k), Start: p.l, End: p.r, RequiredHits: ks[k]}
 			}
 			verifyResult(t, ivs, frozen)
 			cases++
 		}
 		for i := 0; i < len(all); i++ {
-			emit(all[i])
+			for _, p1 := range pat1 {
+				emit([]int{p1[0]}, all[i])
+			}
 			for j := i; j < len(all); j++ {
-				emit(all[i], all[j])
+				for _, p2 := range pat2 {
+					emit([]int{p2[0], p2[1]}, all[i], all[j])
+				}
 				for k := j; k < len(all); k++ {
-					emit(all[i], all[j], all[k])
+					for _, p3 := range pat3 {
+						emit([]int{p3[0], p3[1], p3[2]}, all[i], all[j], all[k])
+					}
 				}
 			}
 		}
@@ -414,7 +606,7 @@ func TestExhaustiveSmall(t *testing.T) {
 
 // TestRandomizedLargeCoordinates fuzzes realistic instances including large
 // coordinates (where brute force enumerates only the free points that actually
-// matter), overlaps, touching segments and fully-frozen failures.
+// matter), overlapping demands, touching segments and fully-frozen failures.
 func TestRandomizedLargeCoordinates(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 
@@ -434,7 +626,7 @@ func TestRandomizedLargeCoordinates(t *testing.T) {
 					break
 				}
 			}
-			ivs[k] = Interval{ID: id, Start: l, End: r}
+			ivs[k] = Interval{ID: id, Start: l, End: r, RequiredHits: 1 + rng.Intn(3)}
 		}
 
 		nf := rng.Intn(4)
@@ -475,6 +667,29 @@ func TestLargeCoordinateValues(t *testing.T) {
 	if res3.Fail.IntervalID != "b" || res3.Fail.Position != 1 {
 		t.Fatalf("failure = %+v, order=%v", res3.Fail, res3.Order)
 	}
+
+	// Three distinct samples at the top of the range: picked right to left.
+	ivs4 := []Interval{{ID: "top", Start: 999_999_998, End: 1_000_000_000, RequiredHits: 3}}
+	res4 := Plan(ivs4, nil)
+	want := []int64{999_999_998, 999_999_999, 1_000_000_000}
+	for i, w := range want {
+		if res4.Points[i].Batch != w {
+			t.Fatalf("point %d = %d, want %d", i, res4.Points[i].Batch, w)
+		}
+	}
+	if !reflect.DeepEqual(res4.Hits[0].Batches, want) {
+		t.Fatalf("hits = %v, want %v", res4.Hits[0].Batches, want)
+	}
+
+	// A two-integer island at 10^9 cannot supply 3 samples: gap of 1.
+	frozen5 := []FrozenRange{{Start: 0, End: 999_999_998}}
+	res5 := Plan(ivs4, frozen5)
+	if res5.Status != "NO_SAMPLE_POINT" || res5.Fail.Missing != 1 || res5.Fail.IntervalID != "top" {
+		t.Fatalf("res5 = %+v", res5)
+	}
+	if len(res5.Points) != 0 || len(res5.Hits) != 0 {
+		t.Fatalf("partial plan leaked: %+v", res5)
+	}
 }
 
 func TestFailureEarliestInProcessingOrder(t *testing.T) {
@@ -494,7 +709,7 @@ func TestFailureEarliestInProcessingOrder(t *testing.T) {
 	if !reflect.DeepEqual(res.Order, []string{"other", "later", "first"}) {
 		t.Fatalf("order = %v", res.Order)
 	}
-	if res.Fail.IntervalID != "later" || res.Fail.Position != 2 {
+	if res.Fail.IntervalID != "later" || res.Fail.Position != 2 || res.Fail.Missing != 1 {
 		t.Fatalf("fail = %+v", res.Fail)
 	}
 }
