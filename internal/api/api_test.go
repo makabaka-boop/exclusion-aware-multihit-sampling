@@ -61,6 +61,74 @@ func TestAPI_HappyPath(t *testing.T) {
 	if int(got["sample_count"].(float64)) != 2 {
 		t.Fatalf("sample_count = %v", got["sample_count"])
 	}
+	// Each interval is hit exactly once: R1 by 4, R2 by 10.
+	wantHits := []any{map[string]any{"id": "R1", "batches": []any{float64(4)}},
+		map[string]any{"id": "R2", "batches": []any{float64(10)}}}
+	if !reflect.DeepEqual(got["interval_hits"].([]any), wantHits) {
+		t.Fatalf("interval_hits = %v", got["interval_hits"])
+	}
+}
+
+func TestAPI_RequiredHits(t *testing.T) {
+	h := Handler()
+	body := `{
+		"intervals": [
+			{"id": "R1", "start": 1, "end": 5, "required_hits": 2},
+			{"id": "R2", "start": 1, "end": 5}
+		],
+		"frozen": []
+	}`
+	status, got := post(t, h, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d body=%v", status, got)
+	}
+	// R1 (k=2) picks 5 and 4; R2 (unset -> 1) is served by the shared 5.
+	if int(got["sample_count"].(float64)) != 2 {
+		t.Fatalf("sample_count = %v", got["sample_count"])
+	}
+	points := got["points"].([]any)
+	first := points[0].(map[string]any)
+	if int64(first["batch"].(float64)) != 4 ||
+		!reflect.DeepEqual(asStrings(first["covered_ids"].([]any)), []string{"R1"}) {
+		t.Fatalf("first point = %v", first)
+	}
+	second := points[1].(map[string]any)
+	if int64(second["batch"].(float64)) != 5 ||
+		!reflect.DeepEqual(asStrings(second["covered_ids"].([]any)), []string{"R1", "R2"}) {
+		t.Fatalf("second point = %v", second)
+	}
+	wantHits := []any{map[string]any{"id": "R1", "batches": []any{float64(4), float64(5)}},
+		map[string]any{"id": "R2", "batches": []any{float64(5)}}}
+	if !reflect.DeepEqual(got["interval_hits"].([]any), wantHits) {
+		t.Fatalf("interval_hits = %v", got["interval_hits"])
+	}
+}
+
+func TestAPI_RequiredHitsValidation(t *testing.T) {
+	h := Handler()
+	bad := []string{
+		`{"intervals":[{"id":"a","start":0,"end":1,"required_hits":0}],"frozen":[]}`,
+		`{"intervals":[{"id":"a","start":0,"end":1,"required_hits":4}],"frozen":[]}`,
+		`{"intervals":[{"id":"a","start":0,"end":1,"required_hits":-1}],"frozen":[]}`,
+		`{"intervals":[{"id":"a","start":0,"end":1,"required_hits":1.5}],"frozen":[]}`,
+		`{"intervals":[{"id":"a","start":0,"end":1,"required_hits":"2"}],"frozen":[]}`,
+	}
+	for _, body := range bad {
+		status, got := post(t, h, body)
+		if status != http.StatusUnprocessableEntity {
+			t.Fatalf("body %s: status = %d, want 422 (%v)", body, status, got)
+		}
+	}
+	for _, k := range []int{1, 2, 3} {
+		body := `{"intervals":[{"id":"a","start":0,"end":5,"required_hits":` + itoa(k) + `}],"frozen":[]}`
+		status, got := post(t, h, body)
+		if status != http.StatusOK {
+			t.Fatalf("required_hits=%d: status = %d (%v)", k, status, got)
+		}
+		if int(got["sample_count"].(float64)) != k {
+			t.Fatalf("required_hits=%d: sample_count = %v", k, got["sample_count"])
+		}
+	}
 }
 
 func TestAPI_NoSamplePoint(t *testing.T) {
@@ -79,8 +147,36 @@ func TestAPI_NoSamplePoint(t *testing.T) {
 	if got["failed_interval_id"] != "R1" || int(got["failed_position"].(float64)) != 1 {
 		t.Fatalf("failure fields = %v", got)
 	}
+	if int(got["missing"].(float64)) != 1 {
+		t.Fatalf("missing = %v", got["missing"])
+	}
 	if int(got["sample_count"].(float64)) != 0 {
 		t.Fatalf("sample_count = %v", got["sample_count"])
+	}
+	if len(got["points"].([]any)) != 0 {
+		t.Fatalf("partial plan leaked: %v", got["points"])
+	}
+}
+
+func TestAPI_NoSamplePointMissing(t *testing.T) {
+	h := Handler()
+	// Usable integers in [3,5] are {3} (4 and 5 frozen): demand 3, gap 2.
+	body := `{
+		"intervals": [{"id": "R1", "start": 3, "end": 5, "required_hits": 3}],
+		"frozen": [{"start": 4, "end": 5}]
+	}`
+	status, got := post(t, h, body)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d", status)
+	}
+	if got["status"] != "NO_SAMPLE_POINT" {
+		t.Fatalf("body = %v", got)
+	}
+	if got["failed_interval_id"] != "R1" || int(got["failed_position"].(float64)) != 1 {
+		t.Fatalf("failure fields = %v", got)
+	}
+	if int(got["missing"].(float64)) != 2 {
+		t.Fatalf("missing = %v, want 2", got["missing"])
 	}
 	if len(got["points"].([]any)) != 0 {
 		t.Fatalf("partial plan leaked: %v", got["points"])

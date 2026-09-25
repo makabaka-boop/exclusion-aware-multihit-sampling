@@ -1,12 +1,16 @@
 // Package planner implements the frozen-aware minimum hitting-point solver.
 //
-// Given a collection of closed integer risk intervals and a collection of
-// closed integer frozen intervals, it finds the smallest set of batch numbers
-// such that every risk interval contains at least one selected number and no
-// selected number lies inside a frozen segment.
+// Given a collection of closed integer risk intervals, each demanding
+// RequiredHits distinct sample batches, and a collection of closed integer
+// frozen segments, it finds the smallest set of batch numbers such that
+// every risk interval contains at least RequiredHits selected numbers and
+// no selected number lies inside a frozen segment. One selected batch may
+// serve several different intervals, but it never counts twice for the
+// same interval.
 package planner
 
 import (
+	"slices"
 	"sort"
 )
 
@@ -15,6 +19,10 @@ type Interval struct {
 	ID    string `json:"id"`
 	Start int64  `json:"start"`
 	End   int64  `json:"end"`
+	// RequiredHits is the number of distinct batch numbers that must be
+	// sampled inside [Start, End]. Zero means "not set" and keeps the
+	// legacy single-hit semantics. The API layer restricts values to 1..3.
+	RequiredHits int `json:"required_hits,omitempty"`
 }
 
 // FrozenRange is one frozen segment as it arrives from the request.
@@ -35,11 +43,21 @@ type Point struct {
 	Covered []string `json:"covered_ids"`
 }
 
-// Failure identifies the first risk interval (in processing order) that
-// contains no selectable batch number.
+// IntervalHits lists the distinct sample batches that satisfy one risk
+// interval, ascending. Hits are reported in the intervals' processing order.
+type IntervalHits struct {
+	ID      string  `json:"id"`
+	Batches []int64 `json:"batches"`
+}
+
+// Failure identifies the first risk interval (in processing order) whose
+// usable batch numbers are insufficient for its RequiredHits.
 type Failure struct {
 	IntervalID string `json:"interval_id"`
 	Position   int    `json:"failed_position"`
+	// Missing is the gap: how many more usable batch numbers the interval
+	// would need to satisfy its RequiredHits.
+	Missing int `json:"missing"`
 }
 
 // Result is the normalized outcome of a planning run.
@@ -48,6 +66,9 @@ type Result struct {
 	Status string
 	// Points carries the complete plan; it is nil (never partial) on failure.
 	Points []Point
+	// Hits lists, in processing order, the batches hitting each interval;
+	// it is nil (never partial) on failure.
+	Hits []IntervalHits
 	// Order is the processing order, i.e. interval IDs sorted by
 	// (end asc, id asc, original index asc).
 	Order []string
@@ -115,6 +136,9 @@ func processingOrder(intervals []Interval) []int {
 // seg is the output of NormalizeFrozen: segments are disjoint, sorted by start
 // and separated by at least one free integer.
 func rightmostFree(seg []Segment, lo, hi int64) (int64, bool) {
+	if hi < lo {
+		return 0, false
+	}
 	// Find the last segment starting at or below hi.
 	j := sort.Search(len(seg), func(i int) bool { return seg[i].Start > hi }) - 1
 	if j < 0 || seg[j].End < hi {
@@ -134,13 +158,20 @@ func rightmostFree(seg []Segment, lo, hi int64) (int64, bool) {
 // Plan computes the minimum sampling plan.
 //
 // The intervals are processed in order of increasing right endpoint (ties by
-// id, then input order). An interval already containing the most recently
-// selected point is covered "for free". Otherwise the largest available
-// integer not exceeding its right endpoint is selected. Selecting as far right
-// as possible is the standard exchange-argument optimum for minimum hitting
-// points, and jumping over frozen segments preserves that optimality because
-// any feasible solution must pick some point no greater than the one chosen,
-// which the chosen point can replace without losing later coverage.
+// id, then input order). For each interval, the distinct batches already
+// selected inside it are counted; when fewer than RequiredHits are present,
+// new batches are picked from right to left — the largest usable integer not
+// exceeding the cursor — skipping frozen segments and batches already
+// selected (a batch may not serve the same interval twice), until the demand
+// is met. Selecting as far right as possible is the standard
+// exchange-argument optimum for minimum hitting points, and jumping over
+// frozen segments preserves that optimality because any feasible solution
+// must pick some point no greater than the one chosen, which the chosen
+// point can replace without losing later coverage.
+//
+// When an interval does not contain enough usable integers, Plan aborts with
+// the first such interval in processing order and the exact gap, publishing
+// no partial plan.
 func Plan(intervals []Interval, frozen []FrozenRange) Result {
 	seg := NormalizeFrozen(frozen)
 	order := processingOrder(intervals)
@@ -150,42 +181,82 @@ func Plan(intervals []Interval, frozen []FrozenRange) Result {
 		orderIDs[pos] = intervals[i].ID
 	}
 
-	points := make([]Point, 0)
-	var lastBatch int64
+	var batches []int64             // selected batch numbers, strictly increasing
+	covered := map[int64][]string{} // batch -> intervals it serves, in processing order
+	hits := make([]IntervalHits, 0, len(intervals))
 
 	for pos, i := range order {
 		iv := intervals[i]
-
-		// Points are strictly increasing, so only the latest selected point
-		// can possibly lie inside this interval.
-		if n := len(points); n > 0 && lastBatch >= iv.Start {
-			points[n-1].Covered = append(points[n-1].Covered, iv.ID)
-			continue
+		k := iv.RequiredHits
+		if k <= 0 {
+			k = 1 // unset keeps the legacy single-hit semantics
 		}
 
-		p, ok := rightmostFree(seg, iv.Start, iv.End)
-		if !ok {
-			// Abort with no partial plan.
-			return Result{
-				Status: "NO_SAMPLE_POINT",
-				Order:  orderIDs,
-				Fail: Failure{
-					IntervalID: iv.ID,
-					Position:   pos + 1,
-				},
+		// Processing order has non-decreasing right endpoints and every
+		// selected batch is <= its interval's right endpoint, so the batches
+		// inside this interval are exactly the suffix at or above iv.Start.
+		j := sort.Search(len(batches), func(b int) bool { return batches[b] >= iv.Start })
+		inside := len(batches) - j
+
+		// The interval is served by its largest existing batches (up to k).
+		keep := k
+		if inside < keep {
+			keep = inside
+		}
+		assigned := make([]int64, 0, k)
+		for _, b := range batches[len(batches)-keep:] {
+			covered[b] = append(covered[b], iv.ID)
+			assigned = append(assigned, b)
+		}
+
+		// Pick the missing samples from right to left.
+		cursor := iv.End
+		for need := k - keep; need > 0; {
+			p, ok := rightmostFree(seg, iv.Start, cursor)
+			if !ok {
+				// Every usable integer inside the interval is already
+				// selected, so need is exactly the gap. Abort with no
+				// partial plan.
+				return Result{
+					Status: "NO_SAMPLE_POINT",
+					Order:  orderIDs,
+					Fail: Failure{
+						IntervalID: iv.ID,
+						Position:   pos + 1,
+						Missing:    need,
+					},
+				}
 			}
+			at := sort.Search(len(batches), func(b int) bool { return batches[b] >= p })
+			if at < len(batches) && batches[at] == p {
+				// Already selected: it was counted in `inside`, so it may
+				// not serve this interval twice. Continue left of it.
+				cursor = p - 1
+				continue
+			}
+			// Insert p, keeping batches sorted.
+			batches = append(batches, 0)
+			copy(batches[at+1:], batches[at:])
+			batches[at] = p
+			covered[p] = []string{iv.ID}
+			assigned = append(assigned, p)
+			cursor = p - 1
+			need--
 		}
 
-		lastBatch = p
-		points = append(points, Point{
-			Batch:   p,
-			Covered: []string{iv.ID},
-		})
+		slices.Sort(assigned)
+		hits = append(hits, IntervalHits{ID: iv.ID, Batches: assigned})
+	}
+
+	points := make([]Point, 0, len(batches))
+	for _, b := range batches {
+		points = append(points, Point{Batch: b, Covered: covered[b]})
 	}
 
 	return Result{
 		Status: "OK",
 		Points: points,
+		Hits:   hits,
 		Order:  orderIDs,
 	}
 }

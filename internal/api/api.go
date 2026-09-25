@@ -23,6 +23,9 @@ type intervalDTO struct {
 	ID    *string `json:"id"`
 	Start *int64  `json:"start"`
 	End   *int64  `json:"end"`
+	// RequiredHits is optional; a missing field keeps the legacy
+	// single-hit semantics.
+	RequiredHits *int64 `json:"required_hits"`
 }
 
 // frozenDTO is the on-the-wire frozen segment.
@@ -41,11 +44,17 @@ type pointJSON struct {
 	CoveredIDs []string `json:"covered_ids"`
 }
 
+type intervalHitsJSON struct {
+	ID      string  `json:"id"`
+	Batches []int64 `json:"batches"`
+}
+
 type responseOK struct {
-	Status          string      `json:"status"`
-	SampleCount     int         `json:"sample_count"`
-	Points          []pointJSON `json:"points"`
-	ProcessingOrder []string    `json:"processing_order"`
+	Status          string             `json:"status"`
+	SampleCount     int                `json:"sample_count"`
+	Points          []pointJSON        `json:"points"`
+	IntervalHits    []intervalHitsJSON `json:"interval_hits"`
+	ProcessingOrder []string           `json:"processing_order"`
 }
 
 type responseFail struct {
@@ -55,6 +64,7 @@ type responseFail struct {
 	ProcessingOrder []string    `json:"processing_order"`
 	FailedInterval  string      `json:"failed_interval_id"`
 	FailedPosition  int         `json:"failed_position"`
+	Missing         int         `json:"missing"`
 }
 
 type errorBody struct {
@@ -126,7 +136,19 @@ func parseRequest(body []byte) ([]planner.Interval, []planner.FrozenRange, error
 		if *iv.Start > *iv.End {
 			return nil, nil, errors.New("interval start must be <= end")
 		}
-		intervals = append(intervals, planner.Interval{ID: id, Start: *iv.Start, End: *iv.End})
+		requiredHits := 1
+		if iv.RequiredHits != nil {
+			if *iv.RequiredHits < 1 || *iv.RequiredHits > 3 {
+				return nil, nil, errors.New("required_hits must be an integer in [1, 3]")
+			}
+			requiredHits = int(*iv.RequiredHits)
+		}
+		intervals = append(intervals, planner.Interval{
+			ID:           id,
+			Start:        *iv.Start,
+			End:          *iv.End,
+			RequiredHits: requiredHits,
+		})
 	}
 
 	frozen := make([]planner.FrozenRange, 0, len(frz))
@@ -182,6 +204,7 @@ func Handler() http.Handler {
 				ProcessingOrder: res.Order,
 				FailedInterval:  res.Fail.IntervalID,
 				FailedPosition:  res.Fail.Position,
+				Missing:         res.Fail.Missing,
 			})
 			return
 		}
@@ -190,10 +213,15 @@ func Handler() http.Handler {
 		for _, p := range res.Points {
 			points = append(points, pointJSON{Batch: p.Batch, CoveredIDs: p.Covered})
 		}
+		hits := make([]intervalHitsJSON, 0, len(res.Hits))
+		for _, h := range res.Hits {
+			hits = append(hits, intervalHitsJSON{ID: h.ID, Batches: h.Batches})
+		}
 		writeJSON(w, http.StatusOK, responseOK{
 			Status:          "OK",
 			SampleCount:     len(points),
 			Points:          points,
+			IntervalHits:    hits,
 			ProcessingOrder: res.Order,
 		})
 	})
